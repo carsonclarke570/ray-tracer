@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.2)
+project(Lab5)
+
+file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/src/*.cpp")
+file(GLOB_RECURSE HEADERS "${CMAKE_SOURCE_DIR}/include/*.h")
+file(GLOB_RECURSE SHADERS "${CMAKE_SOURCE_DIR}/shaders/*.*")
+
+file(COPY ${SHADERS} DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+
+add_subdirectory("${CMAKE_SOURCE_DIR}/lib/glew-cmake/build/cmake")
+set(GLFW_DIR "${CMAKE_SOURCE_DIR}/lib/glfw")
+set(GLFW_BUILD_EXAMPLES OFF CACHE INTERNAL "Build the GLFW example programs")
+set(GLFW_BUILD_TESTS OFF CACHE INTERNAL "Build the GLFW test programs")
+set(GLFW_BUILD_DOCS OFF CACHE INTERNAL "Build the GLFW documentation")
+set(GLFW_INSTALL OFF CACHE INTERNAL "Generate installation target")
+add_subdirectory("${GLFW_DIR}")
+
+add_library(soil-lib STATIC 
+    "${CMAKE_SOURCE_DIR}/lib/soil/src/image_helper.c"
+    "${CMAKE_SOURCE_DIR}/lib/soil/src/stb_image_aug.c"
+    "${CMAKE_SOURCE_DIR}/lib/soil/src/image_DXT.c"
+    "${CMAKE_SOURCE_DIR}/lib/soil/src/SOIL.c"
+)
+
+include_directories("${CMAKE_SOURCE_DIR}/include")
+add_executable(${PROJECT_NAME} ${HEADERS} ${SOURCES})
+
+# GLFW
+target_link_libraries(${PROJECT_NAME} "glfw" "${GLFW_LIBRARIES}")
+target_include_directories(${PROJECT_NAME} PRIVATE "${GLFW_DIR}/include")
+target_compile_definitions(${PROJECT_NAME} PRIVATE "GLFW_INCLUDE_NONE")
+
+# GLEW
+target_include_directories(${PROJECT_NAME} PRIVATE "${PROJECT_SOURCE_DIR}/lib/glew-cmake/include")
+target_link_libraries(${PROJECT_NAME} glew_s)
+
+# SOIL
+target_include_directories(soil-lib INTERFACE "${CMAKE_SOURCE_DIR}/lib/soil/src")
+target_link_libraries(${PROJECT_NAME} soil-lib)
