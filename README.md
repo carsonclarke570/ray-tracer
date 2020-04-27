@@ -1,6 +1,6 @@
 # ray-tracer
 
-![alt text](https://github.com/carsonclarke570/ray-tracer/blob/master/images/title.png)
+<div style="text-align:center"><img src="https://github.com/carsonclarke570/ray-tracer/blob/master/images/title.png" /></div>
 
 A (fairly) simple raytracer based off of Peter Shirley's https://raytracing.github.io/. Written for a final project in computer graphics. This mostly exists as a sandbox for me to try implementing various ray-tracing methods.
 
