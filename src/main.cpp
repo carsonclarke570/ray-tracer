@@ -5,6 +5,7 @@
  */
 
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -20,20 +21,23 @@
 #include "camera.h"
 #include "shader.h"
 
-// Dimensions of the drawing window
+#define FPS_CAP 60.0f
+
+// Window
+GLFWwindow *window;
 int w_width  = 1024;
 int w_height = 512;
+
+// Materials
+Camera* c_camera;
+Shader s_quad, s_compute;
+Texture t_render;
 
 // Callbacks
 void glfwError(int code, const char *desc) {
     std::cerr << "GLFW error " << code << ": " << desc << std::endl;
     exit( 2 );
 }
-
-
-// Materials
-Shader s_quad, s_compute;
-Texture t_render;
 
 void init() {
 
@@ -46,10 +50,10 @@ void init() {
 
     // Camera
     float aspect = float(w_width) / float(w_height);
-    vec3 target = vec3(0, 0, -1);
+    vec3 target = vec3(0, 0, 0);
     vec3 pos = vec3(-2, 2, 1);
     float focus = (pos - target).length();
-    Camera c_camera = Camera(pos, target, vec3(0, 1, 0), 90.0f, aspect, 0.1f, focus);
+    c_camera = new Camera(pos, target, vec3(0, 1, 0), 90.0f, aspect, 0.1f, focus);
 
     // Quad rendering
     s_quad = Shader();
@@ -65,11 +69,11 @@ void init() {
     // Configure shaders
     s_compute.bind();
     s_compute.uniform_int("dest", 0);
-    s_compute.uniform_int("samples", 150);
-    s_compute.uniform_int("depth", 30);
+    s_compute.uniform_int("samples", 1000);
+    s_compute.uniform_int("depth", 3);
     s_compute.uniform_float("width", (float) w_width);
     s_compute.uniform_float("height", (float) w_height);
-    c_camera.update_shader(s_compute);
+    c_camera->update_shader(s_compute);
 
 
     s_quad.bind();
@@ -96,6 +100,33 @@ void init() {
     glEnableVertexAttribArray(posPtr);
 }
 
+void update(double t) {
+    float d = t / 10;
+    float x = cos(d);
+    float z = sin(d);
+    float y = 2 + cos(d);
+    
+    vec3 target = vec3(0, 0, 0);
+    vec3 pos = vec3(x, y, z);
+
+    c_camera->update(pos, target, vec3(0, 1, 0));
+}
+
+void render() {
+     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Compute Shader
+    s_compute.bind();
+    c_camera->update_shader(s_compute);
+    glDispatchCompute(w_width / 32, w_height / 32, 1);
+
+    // Draw to screen
+    s_quad.bind();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glfwSwapBuffers(window);
+}
+
 int main( int argc, char **argv ) {
 
     // Initialize GLFW
@@ -106,7 +137,7 @@ int main( int argc, char **argv ) {
     }
 
     // Create window
-    GLFWwindow *window = glfwCreateWindow( w_width, w_height, "Final Project", NULL, NULL);
+    window = glfwCreateWindow( w_width, w_height, "Final Project", NULL, NULL);
     if(!window) {
         std::cerr << "GLFW window create failed!" << std::endl;
         glfwTerminate();
@@ -150,29 +181,37 @@ int main( int argc, char **argv ) {
 
     init();
 
-    bool r = true;
-    int t = 0;
+    time_t last_render = time(NULL);
+    time_t last_second = time(NULL);
+    time_t start = time(NULL);
+    double diff;
+    double t = 0.0f;
+    int frames = 0;
     while( !glfwWindowShouldClose(window) ) {
-        
-        // Render logic
-        if (r) {
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-            // Compute Shader
-            s_compute.bind();
-            glDispatchCompute(w_width / 32, w_height / 32, 1);
+        t = difftime(time(NULL), start);
+        update(t);
 
-            // Draw to screen
-            s_quad.bind();
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        diff = difftime(time(NULL), last_render);
+        if (diff >= (1.0f / FPS_CAP)) {
+            render();
 
-            glfwSwapBuffers(window);
-            r = false;
-        }   
-        
+            frames++;
+
+            last_render = time(NULL);
+        }
+
+        diff = difftime(time(NULL), last_second);
+        if (diff >= 1.0f) {
+            printf("[FPS] - %d\n", frames);
+            frames = 0;
+            last_second = time(NULL);
+        }
         // Process events
-        glfwPollEvents();
+        glfwPollEvents(); 
     }
+
+    delete c_camera;
 
     glfwDestroyWindow( window );
     glfwTerminate();

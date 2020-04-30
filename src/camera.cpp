@@ -1,17 +1,26 @@
 #include "camera.h"
 
 Camera::Camera(vec3 position, vec3 lookat, vec3 up, float fov, float aspect, float aperature, float focus) {
-    float theta = (fov * MATH_PI) / 180.0f;
-    float hh = tan(theta / 2);
-    float hw = aspect * hh;
+    this->fov = fov;
+    this->aspect = aspect;
+    this->aperature = aperature;
+    this->focus = focus;
+    
+    this->update(position, lookat, up);
+}
 
-    w = (position - lookat).normalize();
-    u = up.cross(w).normalize();
-    v = w.cross(u);
+void Camera::update(vec3 position, vec3 lookat, vec3 up) {
+    float theta = (this->fov * MATH_PI) / 180.0f;
+    float hh = tan(theta / 2);
+    float hw = this->aspect * hh;
+
+    this->w = (position - lookat).normalize();
+    this->u = up.cross(w).normalize();
+    this->v = w.cross(u);
 
     this->origin = position;
-    this->lens = aperature / 2;
-    this->lower_left = origin - (hw * focus * u) - (hh * focus * v) - (focus * w);
+    this->lens = this->aperature / 2;
+    this->lower_left = position - (hw * focus * u) - (hh * focus * v) - (focus * w);
     this->right = 2 * hw * focus * u;
     this->up = 2 * hh * focus * v;
 }

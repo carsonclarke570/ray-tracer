@@ -4,36 +4,69 @@
 
 #define MAT_LAMBERTIAN 0
 #define MAT_METAL 1
+#define MAT_DIELECTRIC 2
+#define MAT_DIFFUSE_LIGHT 3
 
-// Screen texture
-writeonly uniform image2D dest;
+#define NUM_SPHERES 4
 
-// Raytracing structures
-struct ray {
-    vec3 origin;
-    vec3 direction;
-};
+//
+//  Hash Functions
+//
 
-struct material {
-    int type;
-    vec3 albedo;
-    float fuzz;
-    float ref_idx;
-};
+float g_seed = 0.0f;
 
-struct hit {
-    float t;
-    vec3 point;
-    vec3 normal;
-    bool front;
-    material mat;
-};
+uint hash(uvec2 p) {
+    p = 1103515245U*((p >> 1U)^(p.yx));
+    uint h32 = 1103515245U*((p.x)^(p.y>>3U));
+    return h32^(h32 >> 16);
+}
 
-struct sphere {
-    vec3 center;
-    float radius;
-    material mat;
-};
+float hash1f(inout float seed) {
+    uint n = hash(floatBitsToUint(vec2(seed+=.1,seed+=.1)));
+    return float(n)/float(0xffffffffU);
+}
+
+vec2 hash2f(inout float seed) {
+    uint n = hash(floatBitsToUint(vec2(seed+=.1,seed+=.1)));
+    uvec2 rz = uvec2(n, n*48271U);
+    return vec2(rz.xy & uvec2(0x7fffffffU))/float(0x7fffffff);
+}
+
+vec3 hash3f(inout float seed) {
+    uint n = hash(floatBitsToUint(vec2(seed+=.1,seed+=.1)));
+    uvec3 rz = uvec3(n, n*16807U, n*48271U);
+    return vec3(rz & uvec3(0x7fffffffU))/float(0x7fffffff);
+}
+
+vec3 unit_sphere(inout float seed) {
+    vec3 h = hash3f(seed) * vec3(2.,6.28318530718,1.)-vec3(1,0,0);
+    float phi = h.y;
+    float r = pow(h.z, 1./3.);
+	return r * vec3(sqrt(1.-h.x*h.x)*vec2(sin(phi),cos(phi)),h.x);
+}
+
+vec2 unit_disk(inout float seed) {
+    vec2 h = hash2f(seed) * vec2(1.,6.28318530718);
+    float phi = h.y;
+    float r = sqrt(h.x);
+	return r * vec2(sin(phi),cos(phi));
+}
+
+vec3 unit_hemisphere(const vec3 n, inout float seed) {
+    vec2 r = hash2f(seed);
+	vec3  uu = normalize(cross(n, abs(n.y) > 0.5f ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
+	vec3  vv = cross(uu, n);
+	float ra = sqrt(r.y);
+	float rx = ra*cos(6.28318530718*r.x); 
+	float ry = ra*sin(6.28318530718*r.x);
+	float rz = sqrt(1.-r.y);
+	vec3  rr = vec3(rx*uu + ry*vv + rz*n);
+    return normalize(rr);
+}
+
+//
+//  Camera
+//
 
 struct camera {
     vec3 lower_left;
@@ -53,6 +86,82 @@ uniform camera cam;
 
 vec3 horizon = vec3(1.0f, 1.0f, 1.0f);
 vec3 sky = vec3(0.5f, 0.7f, 1.0f);
+writeonly uniform image2D dest;
+
+// RAY
+struct ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+ray get_ray(vec2 s) {
+    vec2 rd = cam.lens * unit_disk(g_seed);
+    vec3 off = (rd.x * cam.u) + (rd.y * cam.v);
+
+    ray r = ray(
+        cam.origin + off,
+        normalize(cam.lower_left + (s.x * cam.right) + (s.y * cam.up) - cam.origin - off)
+    );
+    return r;
+}
+
+struct material {
+    int type;
+    vec3 albedo;
+    vec3 emit;
+    float v;
+};
+
+material gray_metal = material(MAT_METAL,         vec3(0.8),           vec3(0.0), 0.5);
+material gold_metal = material(MAT_METAL,         vec3(0.8, 0.6, 0.2), vec3(0.0), 0.5);
+material dielectric = material(MAT_DIELECTRIC,    vec3(0.0),           vec3(0.0), 0.5);
+material lambert    = material(MAT_LAMBERTIAN,    vec3(0.0, 0.5, 1.0), vec3(0.0), 0.0);
+material light      = material(MAT_DIFFUSE_LIGHT, vec3(1.0),           vec3(4.0), 0.0);
+
+struct hit {
+    float t;
+    vec3 point;
+    vec3 normal;
+    bool front;
+    material mat;
+};
+
+// AABB
+struct aabb {
+    vec3 a;
+    vec3 b;
+};
+
+bool aabb_hit(const aabb box, const ray r, float t_min, float t_max) {
+    float t0, t1;
+    
+    for (int i = 0; i < 3; i++) {
+        float inv = 1.0f / r.direction[0];
+        t0 = (box.a[i] - r.origin[i]) * inv;
+        t1 = (box.b[i] - r.origin[i]) * inv;
+        t0 = inv < 0.0f ? t1 : t0;
+        t1 = inv < 0.0f ? t0 : t1;
+        if (t_max <= t_min) {
+            return false;
+        } 
+    }
+    return true;
+}
+
+// Spheres
+struct sphere {
+    vec3 center;
+    float radius;
+    material mat;
+};
+
+bool sphere_box(const sphere s, out aabb box) {
+    box = aabb(
+        s.center - vec3(s.radius),
+        s.center + vec3(s.radius)
+    );
+    return true;
+}
 
 layout (local_size_x = 32, local_size_y = 32) in;
 
@@ -62,174 +171,206 @@ void set_face(const ray r, vec3 outward, const hit rec, out hit updated) {
     updated.normal = updated.front ? outward : -outward;
 }
 
-bool hit_sphere(const sphere s, const ray r, float t_min, float t_max, out hit rec) {
+bool intersect_sphere(const sphere s, const ray r, float t_min, float t_max, inout float dist) {
     vec3 oc = r.origin - s.center;
-    float a = dot(r.direction, r.direction);
     float b = dot(oc, r.direction);
     float c = dot(oc, oc) - (s.radius * s.radius);
-    float d = b * b - (a * c);
-    
-    if (d > 0) {
-        float t = (-b - sqrt(d)) / a;
-        if (t < t_max && t > t_min) {
-            rec.t = t;
-            rec.point = (r.origin + (t * r.direction));
-            rec.mat = s.mat;
-            
-            vec3 outward = (rec.point - s.center) / s.radius;
-            set_face(r, outward, rec, rec);
-            return true;
-        }
-        t = (-b + sqrt(d)) / a;
-        if (t < t_max && t > t_min) {
-            rec.t = t;
-            rec.point = (r.origin + (t * r.direction));
-            rec.mat = s.mat;
+    float d = b * b - c;
+    if (d < 0.0f) return false;
 
-            vec3 outward = (rec.point - s.center) / s.radius;
-            set_face(r, outward, rec, rec);
-            return true;
-        }
+    float sq = sqrt(d);
+    float t1 = -b - sq;
+    float t2 = -b + sq;
+
+    float t = t1 < t_min ? t2 : t1;
+    if (t < t_max && t > t_min) {
+        dist = t;
+        return true;
+    }
+    return false;
+}
+
+bool hit_sphere(const in sphere s, const in ray r, const in float t_min, const in float t_max, inout hit h) {
+    float dist;
+    if (intersect_sphere(s, r, t_min, t_max, dist)) {
+        h.t = dist;
+        h.point = r.origin + dist * r.direction;
+        h.normal = (h.point - s.center) / s.radius;
+        return true;
     }
     return false;
 }
 
 bool world(const ray r, float t_min, float t_max, out hit rec) {
-    sphere spheres[2];
-    spheres[0].center = vec3(0, 0, -1);
-    spheres[0].radius = 0.5f;
-    spheres[1].mat.albedo = vec3(0.8, 0.3, 0.3);
-    spheres[1].mat.type = 0;
+    sphere spheres[NUM_SPHERES];
+
+    // Big sphere
+    spheres[1].mat = gold_metal;
     spheres[1].center = vec3(0, -100.5, -1);
     spheres[1].radius = 100.0f;
-    spheres[0].mat.albedo = vec3(0.8f, 0.8f, 0.8f);
-    spheres[0].mat.fuzz = 0.3f;
-    spheres[0].mat.type = 1;
+
+    // Sphere 1
+    spheres[0].center = vec3(0, 0, 0.7);
+    spheres[0].radius = 0.5f;
+    spheres[0].mat = lambert;
+
+    // Sphere 2
+    spheres[2].center = vec3(-0.8, 0, -0.8);
+    spheres[2].radius = 0.5f;
+    spheres[2].mat = light;
+
+    // Sphere 3
+    spheres[3].center = vec3(0.8, 0, -0.8);
+    spheres[3].radius = 0.5f;
+    spheres[3].mat = gray_metal; 
 
     hit temp;
     bool found = false;
     float closest = t_max;
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < NUM_SPHERES; i++) {
         if (hit_sphere(spheres[i], r, t_min, closest, temp)) {
             found = true;
             rec = temp;
+            rec.mat = spheres[i].mat;
             closest = temp.t;
         }
     }
     return found;
 }
 
-float rand(vec2 co) {
-    return 2 * fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43758.5453) - 1;
+float schlick(float c, float r) {
+    float r0 = (1 - r) / (1 + r);
+    r0 = r0 * r0;
+    return r0 + (1 - r0) * pow(1 - c, 5);
 }
 
-vec3 unit_circle(vec3 seed) {
-    int n = 0;
-    do {
-        seed = vec3(rand(seed.xy), rand(seed.zy), rand(seed.xz));
-        n++;
-    } while(dot(seed, seed) >= 1.0 && n < 3);
-    
-    return seed;
-}
-
-vec3 unit_disk(vec2 seed) {
-    vec3 p;
-    int n = 0;
-    do {
-        p = vec3(rand(seed.xy), rand(seed.yx), 0);
-        n++;
-    } while (dot(p,p) >= 1.0 && n < 3);
-    return p;
-}
-
-vec3 unit_hemisphere(vec3 normal) {
-    vec3 r = unit_circle(normal);
-    if (dot(r, normal) > 0.0) {
-        return r;
-    } 
-    return -r;
+bool mrefract(const in vec3 v, const in vec3 n, const in float s, out vec3 ref) {
+    float dt = dot(v, n);
+    float d = 1. - s*s*(1.-dt*dt);
+    if (d > 0.0f) {
+        ref = s * (v - n * dt) - n * sqrt(d);
+        return true;
+    } else { 
+        return false;
+    }
 }
 
 bool scatter_lambertian(const ray r, const hit rec, out vec3 attn, out ray scatter) {
-    vec3 target = rec.point + rec.normal + unit_hemisphere(rec.normal);
-    scatter.origin = rec.point;
-    scatter.direction = target - rec.point;
+    scatter = ray(
+        rec.point,
+        unit_hemisphere(rec.normal, g_seed)
+    );
     attn = rec.mat.albedo;
     return true;
 }
 
 bool scatter_metal(const ray r, const hit rec, out vec3 attn, out ray scatter) {
     vec3 ref = reflect(normalize(r.direction), rec.normal);
-    scatter.origin = rec.point;
-    scatter.direction = ref + (rec.mat.fuzz * unit_hemisphere(rec.normal));
+    scatter = ray(
+        rec.point,
+        normalize(ref + (rec.mat.v * unit_sphere(g_seed)))
+    );
     attn = rec.mat.albedo;
-    return dot(ref, rec.normal) > 0;
-}
-
-bool scatter_dieletric(const ray r, const hit rec, out vec3 attn, out ray scatter) {
-    attn = vec3(1.0f, 1.0f, 1.0f);
-
     return true;
 }
 
-bool dispatch_scatter(const ray r, const hit rec, out vec3 attn, out ray scatter) {
+bool scatter_dieletric(const ray r, const hit rec, out vec3 attn, out ray scatter) {
+    vec3 refl = reflect(normalize(r.direction), rec.normal);
+    float ct = dot(normalize(r.direction), rec.normal);
+    
+    attn = vec3(1.0f, 1.0f, 1.0f);
+    vec3 outward = ct > 0.0f ? -rec.normal : rec.normal;
+    float s = ct > 0.0f ? rec.mat.v : 1.0f / rec.mat.v;
+    ct = ct > 0.0f ? sqrt(1.0f - rec.mat.v * rec.mat.v * (1.0f - ct * ct)) : -ct;
+
+    vec3 refr;
+    float refp;
+    if (mrefract(normalize(r.direction), outward, s, refr)) {
+        refp = schlick(ct, rec.mat.v);
+    } else {
+        refp = 1.0f;
+    }
+
+    if (hash1f(g_seed) < refp) {
+        scatter = ray(
+            rec.point,
+            refl
+        );
+    } else {
+        scatter = ray(
+            rec.point,
+            refr
+        );
+    }
+    return true;
+}
+
+bool dispatch_scatter(const ray r, hit rec, out vec3 attn, out ray scatter) {
     if (rec.mat.type == MAT_METAL) {
         return scatter_metal(r, rec, attn, scatter);
-    } else {
+    } else if (rec.mat.type == MAT_DIELECTRIC) {
+        return scatter_dieletric(r, rec, attn, scatter);
+    } else if (rec.mat.type == MAT_LAMBERTIAN){
         return scatter_lambertian(r, rec, attn, scatter);
-    }
+    } 
+    return false;
 }
 
-vec3 color(ray r, int depth) {
-    int n = 0;
-    hit rec;
+vec3 dispatch_emit(const in hit h) {
+    if (h.mat.type == MAT_DIFFUSE_LIGHT) {
+        return h.mat.emit;
+    } 
+    return vec3(0.0f);
+}
+
+vec3 trace(ray r) {
+
+    hit info;
+    vec3 emitted = vec3(0.0f);
+    vec3 col = vec3(0.0f);
     
-    vec3 attn = vec3(1.0f, 1.0f, 1.0f);
-    while(world(r, 0.01f, 100000000000.0f, rec) && n < depth) {
-        ray scattered;
-        vec3 local_attn;
-        if (dispatch_scatter(r, rec, local_attn, scattered)) {
-            attn *= local_attn;
-            r = scattered;
-        } else {
-            attn = vec3(0.0f, 0.0f, 0.0f);
-        }
-        n = n + 1;
+    for (int i = 0; i < depth; i++) {
+        if (world(r, 0.01, 1.0f/0.0f, info)) {
+            ray scattered;
+            vec3 attenuation;
+            vec3 emit = dispatch_emit(info);
+            emitted += i == 0 ? emit : col * emit;
+            
+            if (dispatch_scatter(r, info, attenuation, scattered)) {
+                col = i == 0 ? attenuation : col * attenuation;
+                r = scattered;
+            } else {
+                return emitted;
+            }
+	    } else {
+            return emitted;
+    	}
+        if(dot(col,col) < 0.0001) return emitted; // optimisation
     }
-
-    vec3 u = normalize(r.direction);
-    float a = 0.5 * (u.y + 1.0f);
-    return attn * mix(horizon, sky, a);
-}
-
-ray get_ray(vec2 s) {
-    ray r;
-
-    vec3 rd = cam.lens * unit_disk(s);
-    vec3 off = (rd.x * cam.u) + (rd.y * cam.v);
-
-    r.origin = cam.origin + off;
-    r.direction = cam.lower_left + (s.x * cam.right) + (s.y * cam.up) - r.origin;
-    return r;
+    return emitted;
 }
 
 void main() {
-    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 pos = uvec2(gl_GlobalInvocationID.xy);
+    g_seed = float(hash(pos)) / float(0xffffffffU);
     
     ray r;
     float u = float(pos.x);
     float v = float(pos.y);
-    vec3 col = vec3(0.0f, 0.0f, 0.0f);
+    vec3 col = vec3(0.0f);
     for (int i = 0; i < samples; i++) {
-        vec2 s = vec2((u + rand(col.xy)) / width, (v + rand(col.xz)) / height);
+        vec2 s = (vec2(u, v) + hash2f(g_seed)) / vec2(float(width), float(height));
 
         r = get_ray(s);
-        col += color(r, depth);
+
+        float a = 0.5 * (normalize(r.direction).y + 1.0f);
+        col += trace(r); //mix(horizon, sky, a));
     }
     col /= float(samples);
+
+    // Gamma correction
     col = vec3(sqrt(col.x), sqrt(col.y), sqrt(col.z));
 
-    imageStore(dest, pos, vec4(col, 1.0));
+    imageStore(dest, ivec2(pos), vec4(col, 1.0));
 }
