@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <chrono>
+#include <thread>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -31,7 +33,7 @@ int w_height = 512;
 // Materials
 Camera* c_camera;
 Shader s_quad, s_compute;
-Texture t_render;
+Texture t_gather, t_render, t_mercury;
 
 // Callbacks
 void glfwError(int code, const char *desc) {
@@ -39,7 +41,7 @@ void glfwError(int code, const char *desc) {
     exit( 2 );
 }
 
-void init() {
+void init(int samples, int depth) {
 
     // Texture
     t_render = Texture();
@@ -48,12 +50,22 @@ void init() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_width, w_height, 0, GL_RGBA, GL_FLOAT, NULL);
     glBindImageTexture(0, t_render.m_texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
+    t_gather = Texture();
+    t_gather.set_sampling(GL_REPEAT, GL_LINEAR);
+    t_gather.bind(1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w_width, w_height, 0, GL_RGBA, GL_FLOAT, NULL);
+    glBindImageTexture(1, t_gather.m_texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+
+    t_mercury = Texture();
+    t_mercury.bind(2);
+    t_mercury.load("earth.jpg");
+
     // Camera
     float aspect = float(w_width) / float(w_height);
-    vec3 target = vec3(0, 0, 0);
-    vec3 pos = vec3(-2, 2, 1);
-    float focus = (pos - target).length();
-    c_camera = new Camera(pos, target, vec3(0, 1, 0), 90.0f, aspect, 0.1f, focus);
+    vec3 target = vec3(278, 278, 0);
+    vec3 pos = vec3(278, 278, -800);
+    float focus = 10.0f;
+    c_camera = new Camera(pos, target, vec3(0, 1, 0), 40.0f, aspect, 0.0f, focus);
 
     // Quad rendering
     s_quad = Shader();
@@ -67,10 +79,19 @@ void init() {
     s_compute.compile();
 
     // Configure shaders
+    srand(time(NULL));
+
     s_compute.bind();
+    t_gather.bind(0);
     s_compute.uniform_int("dest", 0);
-    s_compute.uniform_int("samples", 1000);
-    s_compute.uniform_int("depth", 3);
+    t_render.bind(1);
+    s_compute.uniform_int("src", 1);
+    t_mercury.bind(2);
+    s_compute.uniform_int("mercury_tex", 2);
+
+    s_compute.uniform_int("i_seed", rand());
+    s_compute.uniform_int("samples", samples);
+    s_compute.uniform_int("depth", depth);
     s_compute.uniform_float("width", (float) w_width);
     s_compute.uniform_float("height", (float) w_height);
     c_camera->update_shader(s_compute);
@@ -100,34 +121,28 @@ void init() {
     glEnableVertexAttribArray(posPtr);
 }
 
-void update(double t) {
-    float d = t / 10;
-    float x = cos(d);
-    float z = sin(d);
-    float y = 2 + cos(d);
-    
-    vec3 target = vec3(0, 0, 0);
-    vec3 pos = vec3(x, y, z);
-
-    c_camera->update(pos, target, vec3(0, 1, 0));
-}
-
-void render() {
-     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+void render(int n) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // Compute Shader
     s_compute.bind();
-    c_camera->update_shader(s_compute);
+    t_render.bind(0);
+    t_gather.bind(1);
+    s_compute.uniform_int("i_seed", rand());
+    s_compute.uniform_int("n_render", n);
     glDispatchCompute(w_width / 32, w_height / 32, 1);
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     // Draw to screen
     s_quad.bind();
+    t_render.bind(0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     glfwSwapBuffers(window);
 }
 
-int main( int argc, char **argv ) {
+int gather(int samples, int depth) {
 
     // Initialize GLFW
     glfwSetErrorCallback( glfwError );
@@ -179,36 +194,36 @@ int main( int argc, char **argv ) {
     glDepthFunc(GL_LEQUAL);
     glClearDepth(1.0f);
 
-    init();
+    init(samples, depth);
 
-    time_t last_render = time(NULL);
-    time_t last_second = time(NULL);
     time_t start = time(NULL);
+    time_t last_update = time(NULL);
+    time_t now;
     double diff;
-    double t = 0.0f;
+    double delta;
+    double last_fps = 0;
     int frames = 0;
+    int n = 0;
     while( !glfwWindowShouldClose(window) ) {
+        now = time(NULL);
+        diff = difftime(now, last_update);
+        last_update = now;
+        
+        last_fps += diff;
+        frames++;
 
-        t = difftime(time(NULL), start);
-        update(t);
-
-        diff = difftime(time(NULL), last_render);
-        if (diff >= (1.0f / FPS_CAP)) {
-            render();
-
-            frames++;
-
-            last_render = time(NULL);
-        }
-
-        diff = difftime(time(NULL), last_second);
-        if (diff >= 1.0f) {
+        if (last_fps >= 1.0f) {
             printf("[FPS] - %d\n", frames);
+            last_fps = 0.0f;
             frames = 0;
-            last_second = time(NULL);
         }
-        // Process events
+        n++;
+        render(n);
+
         glfwPollEvents(); 
+
+        int us = (int) ((difftime(last_update, time(NULL)) + (1.0f / FPS_CAP)) * 1000000);
+        std::this_thread::sleep_for(std::chrono::microseconds(us));
     }
 
     delete c_camera;
@@ -216,6 +231,18 @@ int main( int argc, char **argv ) {
     glfwDestroyWindow( window );
     glfwTerminate();
 
-
     return 0;
+}
+
+int main(int argc, char **argv) {
+    int samples = 25;
+    int depth = 20;
+    if (argc >= 3) {
+        depth = atoi(argv[2]);
+    }
+    if (argc >= 2) {
+        samples = atoi(argv[1]);
+    }
+
+    return gather(samples, depth);
 }

@@ -7,7 +7,15 @@
 #define MAT_DIELECTRIC 2
 #define MAT_DIFFUSE_LIGHT 3
 
-#define NUM_SPHERES 4
+#define TEX_SOLID 0
+#define TEX_IMAGE 1
+
+#define RECT_XY 0
+#define RECT_XZ 1
+#define RECT_YZ 2
+
+#define NUM_SPHERES 3
+#define NUM_RECTS   6
 
 //
 //  Hash Functions
@@ -46,7 +54,7 @@ vec3 unit_sphere(inout float seed) {
 }
 
 vec2 unit_disk(inout float seed) {
-    vec2 h = hash2f(seed) * vec2(1.,6.28318530718);
+    vec2 h = hash2f(seed) * vec2(1.0, 6.28318530718);
     float phi = h.y;
     float r = sqrt(h.x);
 	return r * vec2(sin(phi),cos(phi));
@@ -65,7 +73,7 @@ vec3 unit_hemisphere(const vec3 n, inout float seed) {
 }
 
 //
-//  Camera
+//  CAMERA
 //
 
 struct camera {
@@ -78,17 +86,19 @@ struct camera {
     float lens;
 };
 
+uniform int n_render;
+uniform int i_seed;
 uniform float height;
 uniform float width;
 uniform int samples;
 uniform int depth;
 uniform camera cam;
 
-vec3 horizon = vec3(1.0f, 1.0f, 1.0f);
-vec3 sky = vec3(0.5f, 0.7f, 1.0f);
-writeonly uniform image2D dest;
 
+//
 // RAY
+//
+
 struct ray {
     vec3 origin;
     vec3 direction;
@@ -105,23 +115,32 @@ ray get_ray(vec2 s) {
     return r;
 }
 
-struct material {
+struct texture_ {
     int type;
-    vec3 albedo;
-    vec3 emit;
-    float v;
+    vec3 color;
 };
 
-material gray_metal = material(MAT_METAL,         vec3(0.8),           vec3(0.0), 0.5);
-material gold_metal = material(MAT_METAL,         vec3(0.8, 0.6, 0.2), vec3(0.0), 0.5);
-material dielectric = material(MAT_DIELECTRIC,    vec3(0.0),           vec3(0.0), 0.5);
-material lambert    = material(MAT_LAMBERTIAN,    vec3(0.0, 0.5, 1.0), vec3(0.0), 0.0);
-material light      = material(MAT_DIFFUSE_LIGHT, vec3(1.0),           vec3(4.0), 0.0);
+layout (binding = 2) uniform sampler2D mercury_tex;
+
+vec3 texture_color(const in texture_ t, const in vec2 uv) {
+    if (t.type == TEX_IMAGE) {
+        return vec3(texture(mercury_tex, uv));
+    } 
+    return t.color;
+}
+
+struct material {
+    int type;
+    texture_ albedo;
+    texture_ emit;
+    float v;
+};
 
 struct hit {
     float t;
     vec3 point;
     vec3 normal;
+    vec2 uv;
     bool front;
     material mat;
 };
@@ -148,28 +167,15 @@ bool aabb_hit(const aabb box, const ray r, float t_min, float t_max) {
     return true;
 }
 
-// Spheres
+//
+// SPHERES
+//
+
 struct sphere {
     vec3 center;
     float radius;
     material mat;
 };
-
-bool sphere_box(const sphere s, out aabb box) {
-    box = aabb(
-        s.center - vec3(s.radius),
-        s.center + vec3(s.radius)
-    );
-    return true;
-}
-
-layout (local_size_x = 32, local_size_y = 32) in;
-
-void set_face(const ray r, vec3 outward, const hit rec, out hit updated) {
-    updated = rec;
-    updated.front = dot(r.direction, outward) < 0.0f;
-    updated.normal = updated.front ? outward : -outward;
-}
 
 bool intersect_sphere(const sphere s, const ray r, float t_min, float t_max, inout float dist) {
     vec3 oc = r.origin - s.center;
@@ -196,47 +202,63 @@ bool hit_sphere(const in sphere s, const in ray r, const in float t_min, const i
         h.t = dist;
         h.point = r.origin + dist * r.direction;
         h.normal = (h.point - s.center) / s.radius;
+        h.mat = s.mat;
+
+        float phi = atan(h.normal.z, h.normal.x);
+        float theta = asin(h.normal.y);
+        h.uv = vec2(1 - (phi + PI) / (2 * PI), (theta + (PI / 2)) / PI);
         return true;
     }
     return false;
 }
 
-bool world(const ray r, float t_min, float t_max, out hit rec) {
-    sphere spheres[NUM_SPHERES];
+// 
+// RECTANGLES
+//
 
-    // Big sphere
-    spheres[1].mat = gold_metal;
-    spheres[1].center = vec3(0, -100.5, -1);
-    spheres[1].radius = 100.0f;
+struct rectangle {
+    float a0, a1;
+    float b0, b1;
+    float k;
+    int type;
+    material mat;
+};
 
-    // Sphere 1
-    spheres[0].center = vec3(0, 0, 0.7);
-    spheres[0].radius = 0.5f;
-    spheres[0].mat = lambert;
-
-    // Sphere 2
-    spheres[2].center = vec3(-0.8, 0, -0.8);
-    spheres[2].radius = 0.5f;
-    spheres[2].mat = light;
-
-    // Sphere 3
-    spheres[3].center = vec3(0.8, 0, -0.8);
-    spheres[3].radius = 0.5f;
-    spheres[3].mat = gray_metal; 
-
-    hit temp;
-    bool found = false;
-    float closest = t_max;
-
-    for (int i = 0; i < NUM_SPHERES; i++) {
-        if (hit_sphere(spheres[i], r, t_min, closest, temp)) {
-            found = true;
-            rec = temp;
-            rec.mat = spheres[i].mat;
-            closest = temp.t;
-        }
+bool dispatch_hit_rect(const in rectangle rect, const in ray r, const in float t_min, const in float t_max, inout hit h) {
+    float t, a, b;
+    vec3 n, p;
+    if (rect.type == RECT_XY) {
+        t = (rect.k - r.origin.z) / r.direction.z;
+        p = r.origin + t * r.direction;
+        a = p.x;
+        b = p.y;
+        n = vec3(0, 0, 1);
+    } else if (rect.type == RECT_XZ) {
+        t = (rect.k - r.origin.y) / r.direction.y;
+        p = r.origin + t * r.direction;
+        a = p.x;
+        b = p.z;
+        n = vec3(0, 1, 0);
+    } else if  (rect.type == RECT_YZ) {
+        t = (rect.k - r.origin.x) / r.direction.x;
+        p = r.origin + t * r.direction;
+        a = p.y;
+        b = p.z;
+        n = vec3(1, 0, 0); 
     }
-    return found;
+
+    if (t < t_min || t > t_max) {
+        return false;
+    }
+    if (a < rect.a0 || a > rect.a1 || b < rect.b0 || b > rect.b1) {
+        return false;
+    }
+    bool face = dot(r.direction, n) < 0;
+    h.t = t;
+    h.point = p;
+    h.normal = face ? n : -n;
+    h.mat = rect.mat;
+    return true;
 }
 
 float schlick(float c, float r) {
@@ -261,7 +283,7 @@ bool scatter_lambertian(const ray r, const hit rec, out vec3 attn, out ray scatt
         rec.point,
         unit_hemisphere(rec.normal, g_seed)
     );
-    attn = rec.mat.albedo;
+    attn = texture_color(rec.mat.albedo, rec.uv);
     return true;
 }
 
@@ -271,7 +293,7 @@ bool scatter_metal(const ray r, const hit rec, out vec3 attn, out ray scatter) {
         rec.point,
         normalize(ref + (rec.mat.v * unit_sphere(g_seed)))
     );
-    attn = rec.mat.albedo;
+    attn = texture_color(rec.mat.albedo, rec.uv);
     return true;
 }
 
@@ -319,9 +341,80 @@ bool dispatch_scatter(const ray r, hit rec, out vec3 attn, out ray scatter) {
 
 vec3 dispatch_emit(const in hit h) {
     if (h.mat.type == MAT_DIFFUSE_LIGHT) {
-        return h.mat.emit;
+        return texture_color(h.mat.emit, h.uv);
     } 
     return vec3(0.0f);
+}
+
+// COLORS
+texture_ t_red     = texture_(TEX_SOLID, vec3(0.65, 0.05, 0.05));
+texture_ t_white   = texture_(TEX_SOLID, vec3(0.73));
+texture_ t_green   = texture_(TEX_SOLID, vec3(0.12, 0.45, 0.15));
+texture_ t_gold    = texture_(TEX_SOLID, vec3(0.8, 0.6, 0.2));
+texture_ t_light   = texture_(TEX_SOLID, vec3(6.0));
+texture_ t_none    = texture_(TEX_SOLID, vec3(0.0));
+texture_ t_mercury = texture_(TEX_IMAGE, vec3(0.0));
+
+// SPHERE MATERIALS
+material gold_metal = material(MAT_METAL,         t_gold, t_none, 0.5);
+material dielectric = material(MAT_DIELECTRIC,    t_none, t_none, 1.5);
+material lambert    = material(MAT_LAMBERTIAN,    t_mercury, t_none, 0.0);
+
+// LIGHT MATERIAL
+material light      = material(MAT_DIFFUSE_LIGHT, t_none, t_light, 0.0);
+
+// WALL MATERIALS
+material red        = material(MAT_LAMBERTIAN,    t_red,   t_none, 0.0);
+material white      = material(MAT_LAMBERTIAN,    t_white, t_none, 0.0);
+material green      = material(MAT_LAMBERTIAN,    t_green, t_none, 0.0);
+
+bool world(const ray r, float t_min, float t_max, out hit rec) {
+    sphere spheres[NUM_SPHERES];
+    rectangle rects[NUM_RECTS];
+
+    // Sphere 1
+    spheres[0].center = vec3(120, 110, 410);
+    spheres[0].radius = 100;
+    spheres[0].mat = gold_metal;
+
+    // Sphere 2
+    spheres[1].center = vec3(410.0f, 410.0f, 278.0f);
+    spheres[1].radius = 80f;
+    spheres[1].mat = dielectric;
+
+    // Sphere 3
+    spheres[2].center = vec3(278, 300, 278);
+    spheres[2].radius = 90f;
+    spheres[2].mat = lambert; 
+
+    rects[0] = rectangle(0.0f, 555.0f, 0.0f, 555.0f, 555.0f, RECT_XY, white);
+    rects[1] = rectangle(0.0f, 555.0f, 0.0f, 555.0f, 0.0f, RECT_XZ, white);
+    rects[2] = rectangle(213.0f, 343.0f, 227.0f, 332.0f, 554.0f, RECT_XZ, light);
+    rects[3] = rectangle(0.0f, 555.0f, 0.0f, 555.0f, 555.0f, RECT_XZ, white);
+    rects[4] = rectangle(0.0f, 555.0f, 0.0f, 555.0f, 555.0f, RECT_YZ, red);
+    rects[5] = rectangle(0.0f, 555.0f, 0.0f, 555.0f, 0.0f, RECT_YZ, green);
+
+    hit temp;
+    bool found = false;
+    float closest = t_max;
+
+    for (int i = 0; i < NUM_SPHERES; i++) {
+        if (hit_sphere(spheres[i], r, t_min, closest, temp)) {
+            found = true;
+            rec = temp;
+            closest = temp.t;
+        }
+    }
+
+    for (int i = 0; i < NUM_RECTS; i++) {
+        if (dispatch_hit_rect(rects[i], r, t_min, closest, temp)) {
+            found = true;
+            rec = temp;
+            closest = temp.t;
+        }
+    }
+
+    return found;
 }
 
 vec3 trace(ray r) {
@@ -346,14 +439,19 @@ vec3 trace(ray r) {
 	    } else {
             return emitted;
     	}
-        if(dot(col,col) < 0.0001) return emitted; // optimisation
+        if(dot(col,col) < 0.0001) return emitted; 
     }
     return emitted;
 }
 
+layout (local_size_x = 32, local_size_y = 32) in;
+
+layout(binding = 0, rgba8) uniform image2D dest;
+layout(binding = 1, rgba32f) uniform image2D src;
+
 void main() {
     uvec2 pos = uvec2(gl_GlobalInvocationID.xy);
-    g_seed = float(hash(pos)) / float(0xffffffffU);
+    g_seed = float(hash(i_seed * pos)) / float(0xffffffffU);
     
     ray r;
     float u = float(pos.x);
@@ -367,10 +465,16 @@ void main() {
         float a = 0.5 * (normalize(r.direction).y + 1.0f);
         col += trace(r); //mix(horizon, sky, a));
     }
-    col /= float(samples);
+    // Calulate total
+    vec3 current_color = vec3(imageLoad(src, ivec2(pos)));
+    vec3 total = current_color + col;
+
+    // Average
+    col = total / float(n_render * samples);
 
     // Gamma correction
     col = vec3(sqrt(col.x), sqrt(col.y), sqrt(col.z));
-
+    
+    imageStore(src, ivec2(pos), vec4(total, 1.0));
     imageStore(dest, ivec2(pos), vec4(col, 1.0));
 }
